@@ -34,9 +34,12 @@ import android.util.Log;
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileNotFoundException;
+import java.io.BufferedReader;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * <p>WiredAccessoryObserver monitors for a wired headset on the main board or dock.
@@ -197,6 +200,9 @@ class WiredAccessoryObserver extends UEventObserver {
         }
         context.registerReceiver(new BootCompletedReceiver(),
             new IntentFilter(Intent.ACTION_BOOT_COMPLETED), null, null);
+        
+        // Observe ALSA usb audio events
+        this.mUsbAudioObserver.startObserving("MAJOR=116");
     }
 
     private final class SettingsChangedReceiver extends BroadcastReceiver {
@@ -388,4 +394,149 @@ class WiredAccessoryObserver extends UEventObserver {
             mWakeLock.release();
         }
     };
+    
+	private final UEventObserver mUsbAudioObserver = new UEventObserver() {
+		public void onUEvent(UEventObserver.UEvent event) {
+			if(LOG) Slog.v(WiredAccessoryObserver.TAG, "USB AUDIO UEVENT: " + event.toString());
+			String action = event.get("ACTION");
+			String devpath = event.get("DEVPATH");
+			String major = event.get("MAJOR");
+			String minor = event.get("MINOR");
+			String devname = event.get("DEVNAME");
+			if(LOG) Slog.v(WiredAccessoryObserver.TAG, "onUEvent(device) :: action = " + action + ", MAJOR = " + major + ", MINOR = " + minor + ", DEVPATH = " + devpath);
+			
+			String cardNumber;
+			String deviceNumber;
+			String channels;
+			
+			if (major.equals("116")) {
+				
+				String devpath_lower = devpath.toLowerCase();
+				
+				if ((devpath_lower.contains("usb")) && (!devpath_lower.contains("gadget")) && (devname.endsWith("p"))) {
+					cardNumber = Character.toString(devname.charAt(8));
+					deviceNumber = Character.toString(devname.charAt(10));
+					channels = String.valueOf(WiredAccessoryObserver.this.getChannels(cardNumber));
+					if(LOG) Slog.v(WiredAccessoryObserver.TAG, "cardNumber="+ cardNumber + " deviceNumber=" + deviceNumber + " channels=" + channels);
+					
+					int state = 0;
+					
+					if (action.equals("add")) {
+						state = 1;
+					} else {
+						state = 0;
+					}
+					
+					// Update USB audio details (and then inform the system that an USB audio device has been connected)
+					WiredAccessoryObserver.this.update_usbaudio(state, channels, cardNumber, deviceNumber);	
+				}
+			}
+		}
+	};
+	
+	private int getChannels(String cardNumber) {
+		int channels = 0;
+		String streamContent = "";
+		String streamPath = "/proc/asound/card" + cardNumber + "/stream0";
+		
+		// Parse channel count from /proc/asound/card[n]/stream0
+		try {
+			FileReader file = new FileReader(streamPath);
+			BufferedReader br = new BufferedReader(new FileReader(streamPath));
+			
+			String line;
+			while ((line = br.readLine()) != null) {
+				streamContent += line;
+			}
+			
+			br.close();
+			
+			Pattern regex = Pattern.compile("Playback:.*?Channels: .*?(\\d)", Pattern.DOTALL);
+			Matcher regexMatcher = regex.matcher(streamContent);
+			if (regexMatcher.find()) {
+				channels = Integer.parseInt(regexMatcher.group(1));
+			}
+			
+			if(LOG) Slog.v(TAG, "parsed channels = " + channels);
+		}
+		catch(FileNotFoundException e) {
+			Slog.e(TAG, "Unable to get channels for " + streamPath);
+		}
+		catch(NumberFormatException e) {
+			Slog.e(TAG, "Unable to parse channels for " + streamPath);
+		}
+		catch(Exception e){
+			Slog.e(TAG, "" , e);
+		}
+		
+		if(channels > 0) {
+			return channels;
+		}
+		
+		return 2;
+	}
+	
+	private final void update_usbaudio(int state, String channels, String cardNumber, String deviceNumber) {
+		try {
+			// Send AUDIO_BECOMING_NOISY intent to warn applications of output switch
+			Intent localIntent = new Intent("android.media.AUDIO_BECOMING_NOISY");
+			this.mContext.sendBroadcast(localIntent);
+			
+			UsbAudioData localUsbAudioData = new UsbAudioData();
+			localUsbAudioData.setUsbAudioData(state, channels,cardNumber, deviceNumber);
+			
+			this.mWakeLock.acquire();
+			
+			this.mHandler_usbAudio.sendMessageDelayed(this.mHandler_usbAudio.obtainMessage(0, localUsbAudioData), 500);
+			
+		} finally {
+		}
+	}
+	
+	private final Handler mHandler_usbAudio = new Handler() {
+		public void handleMessage(Message message) {
+			
+			UsbAudioData usbAudioData = (UsbAudioData)message.obj;
+			
+			// Send USB_AUDIO_ACCESSORY_PLUG intent to notify that an USB audio device has been connected.
+			Intent localIntent = new Intent("android.intent.action.USB_AUDIO_ACCESSORY_PLUG");
+			localIntent.putExtra("state", usbAudioData.getState());
+			localIntent.putExtra("card", Integer.parseInt(usbAudioData.getCardNumber()));
+			localIntent.putExtra("device", Integer.parseInt(usbAudioData.getDeviceNumber()));
+			localIntent.putExtra("channels", Integer.parseInt(usbAudioData.getChannels()));
+			WiredAccessoryObserver.this.mContext.sendStickyBroadcast(localIntent);
+			
+			WiredAccessoryObserver.this.mWakeLock.release();
+		}
+	};
+	
+	private final class UsbAudioData {
+		private String cardNumber;
+		private String channels;
+		private String deviceNumber;
+		private int state;
+
+		public String getCardNumber() {
+			return this.cardNumber;
+		}
+
+		public String getChannels() {
+			return this.channels;
+		}
+
+		public String getDeviceNumber() {
+			return this.deviceNumber;
+		}
+
+		public int getState() {
+			return this.state;
+		}
+
+		public void setUsbAudioData(int state, String channels, String cardNumber, String deviceNumber) {
+			this.state = state;
+			this.channels = channels;
+			this.cardNumber = cardNumber;
+			this.deviceNumber = deviceNumber;
+		}
+	}
 }
